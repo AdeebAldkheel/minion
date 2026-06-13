@@ -60,6 +60,23 @@ tail and drops any leading `tool` or unmatched `assistant(tool_calls)` turn
 before splicing the summary in. The `summarized_n` count is bumped by the
 number of extra turns absorbed so the user-visible footer stays honest.
 
+### Added — multi-line chatbox input
+Replaces the bare `input()` prompt with a framed, multi-line editor in the
+terminal. Prompt, streamed model output, tool confirmations, and the next
+prompt all stay in the normal terminal scrollback (no alternate screen) to
+avoid garbling the REPL after submit.
+- Enter submits; Alt+Enter / Ctrl+J insert newlines.
+- Bracketed-paste mode preserves pasted newlines verbatim and strips a
+  trailing newline so pasting never accidentally submits.
+- Up/Down navigate past submissions; Left/Right move within the current
+  line; Home/End jump to line start/end; Ctrl+U clears the line;
+  Ctrl+C cancels.
+- Long lines word-wrap visually inside the box; the buffer stays one logical
+  string (newlines preserved) so the model sees the real text.
+- Falls back to plain `input()` when stdin/stdout is not a TTY.
+- New `read_multiline()` public entry point and `_chatbox_raw()` /
+  `_chatbox_fallback()` helpers; new imports `select`, `shutil`, `termios`.
+
 ### Added — `/compress` context summarization
 New REPL command. Asks the model to summarize everything except the system
 prompt and the last `COMPRESS_KEEP=2` turns, then splices the summary in as a
