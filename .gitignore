@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# generated at runtime by minion.py
+llamacpp.log
+
+# old backups
+bkup/
