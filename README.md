@@ -1,5 +1,9 @@
 # minion
 
+> Entirely written by minion running on MiniMax-M3 — including this README.
+> The agent also manages this repo: commits, pushes, and edits are made
+> through its own `write_file` / `edit_file` / `run_bash` tools.
+
 A tiny single-file coding agent focused on MiniMax-M3. Talks to any OpenAI-compatible server
 (llama.cpp, vLLM, SGLang). Built for self-hosted models whose native tool
 calling isn't fully wired up — falls back to parsing `<tool_call>…</tool_call>`
