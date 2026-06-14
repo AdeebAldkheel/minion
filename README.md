@@ -24,6 +24,30 @@ python minion.py
 
 If `MINION_MODEL` is unset, minion asks the server what it's serving.
 
+## Installing as a `minion` command
+
+If you'd rather have a `minion` command on your `$PATH` (so you can run it
+from anywhere, not just this directory), install the project in editable
+mode from this repo:
+
+```
+pip install -e .
+```
+
+That installs `openai` and `httpx<0.28` (the runtime deps), registers a
+`minion` console script that calls `minion.main()`, and points it at the
+files in this checkout — edits you make here are picked up immediately,
+no reinstall. After that:
+
+```
+export MINION_BASE_URL=http://localhost:8080/v1
+export MINION_MODEL=your-model-name
+export MINION_API_KEY=sk-noop
+minion
+```
+
+Use `pip install .` (no `-e`) if you want a non-editable install instead.
+
 ## Commands
 
 | command             | what it does                                        |
