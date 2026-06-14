@@ -12,7 +12,8 @@ out of the text — the convention most open models (Hermes/Qwen/Nemotron) emit.
   export MINION_API_KEY=sk-noop                    # any string; local servers ignore it
   python minion.py
 
-Toggles in-session: /yolo (skip confirms)  /compress  /compact  /reset  /quit
+Toggles in-session: /yolo (skip confirms)  /approval [level]  /compress  /compact  /reset  /quit
+Flags: --yolo (never prompt)  --approval <low|medium|high>  (sets starting approval level)
 """
 import json
 import os
@@ -33,7 +34,24 @@ client = OpenAI(
     base_url=os.environ.get("MINION_BASE_URL", "http://localhost:8080/v1"),
     api_key=os.environ.get("MINION_API_KEY", "sk-noop"),
 )
-YOLO = "--yolo" in sys.argv  # auto-approve writes/bash
+
+# Approval gating. Three risk levels (low < medium < high) plus an implicit
+# "yolo" mode that never prompts. APPROVE_LEVEL is the minimum level that
+# requires approval: default "low" prompts at everything (today's behavior);
+# "medium" auto-approves low; "high" auto-approves low+medium. YOLO=True
+# short-circuits the risk call entirely — no point asking if we won't act on it.
+LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
+YOLO = "--yolo" in sys.argv
+APPROVE_LEVEL = "low"  # overridden by --approval <level> below
+for _i, _arg in enumerate(sys.argv):
+    if _arg == "--approval" and _i + 1 < len(sys.argv):
+        _lvl = sys.argv[_i + 1].lower()
+        if _lvl in LEVEL_ORDER:
+            APPROVE_LEVEL = _lvl
+        else:
+            print(f"{RED}  ✗ unknown --approval level {_arg!r} (want low|medium|high); using default 'low'{RESET}")
+if YOLO:
+    APPROVE_LEVEL = None  # yolo overrides --approval; never prompt
 
 
 def resolve_model():
@@ -81,9 +99,10 @@ _GOL_GLIDER = {(0, 0), (1, 1), (2, 1), (0, 2), (1, 0)}  # 5-cell, period-4
 
 
 class LifeSpinner:
-    def __init__(self, width=_GOL_W, tick_ms=90):
+    def __init__(self, width=_GOL_W, tick_ms=90, label="thinking"):
         self.w = width
         self.tick = tick_ms / 1000
+        self.label = label  # shown before the cells ("thinking" / "running" / ...)
         self._stop = threading.Event()
         self._t = None
 
@@ -118,7 +137,7 @@ class LifeSpinner:
         try:
             row = self._seed()
             # initial render — also reserve the line so subsequent prints don't shift things
-            sys.stdout.write(CLEAR_LINE + "  " + DIM + "thinking " + RESET +
+            sys.stdout.write(CLEAR_LINE + "  " + DIM + f"{self.label} " + RESET +
                              "".join(_GOL_ALIVE if c else _GOL_DEAD for c in row))
             sys.stdout.flush()
             while not self._stop.is_set():
@@ -126,7 +145,7 @@ class LifeSpinner:
                 if self._stop.is_set():
                     break
                 row = self._step(row)
-                sys.stdout.write(CLEAR_LINE + "  " + DIM + "thinking " + RESET +
+                sys.stdout.write(CLEAR_LINE + "  " + DIM + f"{self.label} " + RESET +
                                  "".join(_GOL_ALIVE if c else _GOL_DEAD for c in row))
                 sys.stdout.flush()
         finally:
@@ -144,6 +163,83 @@ class LifeSpinner:
         if self._t:
             self._t.join(timeout=0.5)
             self._t = None
+
+
+# --- interrupt watcher ------------------------------------------------------
+# Lets the user press Esc during model generation to stop the stream and drop
+# back to the prompt. Runs in a daemon thread for the lifetime of model_turn;
+# the main loop checks _INTERRUPT_EVENT between chunks and closes the stream
+# on interrupt. Tools are NOT cancelled — run_bash etc. run to completion.
+# (Hard-cancelling a tool mid-flight is a separate follow-up.)
+#
+# Two events, two purposes:
+#   _INTERRUPT_EVENT    — "watcher should exit / main loop should check"
+#                          set by main on cleanup, set by watcher on user Esc
+#   _USER_INTERRUPTED   — "the user actually pressed Esc" (not just cleanup)
+#                          only the watcher sets this; main reads it after join
+_INTERRUPT_EVENT = threading.Event()
+_USER_INTERRUPTED = threading.Event()
+
+
+def _interrupt_watcher():
+    """Daemon: watch stdin for bare Esc during model generation.
+
+    Puts stdin into raw mode (ISIG off so Ctrl+C doesn't kill the process)
+    so we can read without echo. A bare Esc (not the start of an arrow-key /
+    bracketed-paste / etc. CSI sequence) sets _USER_INTERRUPTED and
+    _INTERRUPT_EVENT, then returns. Exits when _INTERRUPT_EVENT is set by
+    main's cleanup. Restores termios on exit.
+    """
+    fd = sys.stdin.fileno()
+    if not os.isatty(fd):
+        return
+    try:
+        old = termios.tcgetattr(fd)
+    except Exception:
+        return
+    new = old[:]
+    new[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    new[0] &= ~termios.ICRNL
+    new[6][termios.VMIN] = 0
+    new[6][termios.VTIME] = 0
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+    except Exception:
+        return
+    try:
+        last_fire = 0.0
+        while not _INTERRUPT_EVENT.is_set():
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                c = os.read(fd, 1)
+            except OSError:
+                return
+            if c != b"\x1b":
+                continue  # discard anything that isn't Esc
+            # Could be bare Esc OR the lead byte of an escape sequence
+            # (arrow keys, Home/End, bracketed paste, etc.). Wait up to 50ms
+            # for more bytes; if none arrive, it's a bare Esc.
+            r2, _, _ = select.select([fd], [], [], 0.05)
+            if r2:
+                try:
+                    os.read(fd, 1)  # swallow the rest of the sequence
+                except OSError:
+                    pass
+                continue
+            now = time.time()
+            if now - last_fire < 0.25:  # debounce — don't fire twice in a row
+                continue
+            last_fire = now
+            _USER_INTERRUPTED.set()
+            _INTERRUPT_EVENT.set()
+            return
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
 
 # --- tools ------------------------------------------------------------------
@@ -210,11 +306,135 @@ If your runtime does NOT support native tool calls, emit a call as text exactly 
 Emit nothing after a tool call; wait for the Observation. When the task is done, reply in plain prose."""
 
 
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+REASONING_LOOP_SIGNALS = (
+    "start coding",
+    "let me implement",
+    "let's implement",
+    "now implement",
+    "i'll implement",
+    "i will implement",
+    "write the code",
+    "let me write",
+    "start with the code",
+)
+REASONING_LOOP_SIGNAL_LIMIT = _env_int("MINION_REASONING_LOOP_SIGNALS", 10)
+REASONING_LOOP_NUDGE = (
+    "You are looping in reasoning after repeatedly deciding to start implementation. "
+    "Stop planning now. Take the next concrete action: either call the appropriate tool "
+    "or give the final answer. Do not continue private reasoning."
+)
+
+
+def _nudge_current_user_turn(messages, nudge):
+    for msg in reversed(messages):
+        if msg.get("role") != "user" or not isinstance(msg.get("content"), str):
+            continue
+        if nudge not in msg["content"]:
+            msg["content"] += f"\n\n[Runtime note: {nudge}]"
+        return
+    messages.append({"role": "user", "content": nudge})
+
+
+# --- risk classifier --------------------------------------------------------
+# One cheap non-streaming call per write/bash action. Same model, tiny prompt,
+# expects {"level": "low|medium|high", "reason": "<short>"}. Defensive parse —
+# if the model rambles or returns garbage we fall back to "high" so we err on
+# the side of asking. Skipped entirely in YOLO mode (no point paying for a
+# call we won't act on) and for read-only tools (already implicitly safe).
+
+RISK_SYSTEM = (
+    "You are a risk classifier for a coding agent's tool calls. "
+    "Given one tool action, respond with ONLY a JSON object of the form "
+    '{"level": "low"|"medium"|"high", "reason": "<one short sentence>"}.\n'
+    "Levels:\n"
+    '- low: read-only or trivially reversible (ls, cat, grep, git status, mkdir, touch, file reads).\n'
+    '- medium: modifies state but contained/reversible (writing a single file, editing a file, cp, mv, '
+    'pip install in a venv, running tests, git commit).\n'
+    '- high: destructive, hard to reverse, or broad scope (rm -rf, git push --force, git reset --hard, '
+    'dd, chmod -R, writing outside the project, network sends to external hosts, killing processes, '
+    'system-level changes, anything touching dotfiles in $HOME).\n'
+    "When in doubt, classify higher. Output ONLY the JSON, no preamble."
+)
+
+
+def _assess_risk(action):
+    """Return (level, reason). level is one of LEVEL_ORDER; reason is a short
+    string. On any failure (server down, bad JSON, unknown level) returns
+    ("high", "<error>") so the caller falls through to the prompt path."""
+    try:
+        payload = [
+            {"role": "system", "content": RISK_SYSTEM},
+            {"role": "user", "content": action},
+        ]
+        _log_event("req", {"model": MODEL, "messages": payload, "stream": False, "_purpose": "risk"})
+        resp = client.chat.completions.create(
+            model=MODEL, messages=payload, stream=False, timeout=15)
+        try:
+            _log_event("resp", {"_purpose": "risk", "data": resp.model_dump()})
+        except Exception:
+            pass
+        text = (resp.choices[0].message.content or "").strip()
+        # Try JSON first; fall back to scanning for a level word.
+        level, reason = None, ""
+        try:
+            obj = json.loads(text)
+            level = (obj.get("level") or "").strip().lower()
+            reason = (obj.get("reason") or "").strip()
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            m = re.search(r'\b(low|medium|high)\b', text, re.IGNORECASE)
+            if m:
+                level = m.group(1).lower()
+            reason = text[:120]
+        if level not in LEVEL_ORDER:
+            return ("high", f"unparseable risk response: {text[:80]!r}")
+        return (level, reason or level)
+    except APIConnectionError:
+        return ("high", "server unreachable; defaulting to high")
+    except Exception as e:
+        return ("high", f"risk call failed: {type(e).__name__}")
+
+
+_ACTIVE_SPINNER = None  # set by run_tool() while a tool body is executing
+
+
 def _confirm(action):
+    """Decide whether to run `action`. Returns True to proceed, False to deny.
+
+    Flow:
+      1. YOLO → True (no call, no prompt).
+      2. Ask the model for a risk level (skipped in step 1).
+      3. If level < APPROVE_LEVEL → auto-allow (printed as a one-liner).
+      4. Otherwise prompt, showing the level + reason so the user has context.
+    """
     if YOLO:
         return True
-    ans = input(f"{YELLOW}  allow {action}? [Y/n] {RESET}").strip().lower()
-    return ans != "n"
+    # If a tool spinner is running, pause it around our own I/O so the
+    # auto-allow line / Y/n prompt aren't immediately overwritten by the
+    # next animation tick. (The spinner redraws ~11×/s — without this the
+    # prompt would flicker badly or get erased.)
+    sp = _ACTIVE_SPINNER
+    if sp is not None:
+        sp.stop()
+    try:
+        level, reason = _assess_risk(action)
+        if APPROVE_LEVEL is not None and LEVEL_ORDER[level] < LEVEL_ORDER[APPROVE_LEVEL]:
+            # Auto-allow. Show the assessment so the user has a paper trail.
+            short = reason if len(reason) <= 80 else reason[:77] + "..."
+            print(f"{DIM}  ↳ auto-allow [{level}] {action}  ({short}){RESET}")
+            return True
+        short = reason if len(reason) <= 80 else reason[:77] + "..."
+        lvl_color = {"low": DIM, "medium": YELLOW, "high": RED}[level]
+        ans = input(f"{YELLOW}  allow {action}? {lvl_color}[risk: {level.upper()} — {short}]{RESET} {YELLOW}[Y/n] {RESET}").strip().lower()
+        return ans != "n"
+    finally:
+        if sp is not None:
+            sp.start()
 
 
 # --- text-fallback parsing --------------------------------------------------
@@ -244,10 +464,23 @@ def run_tool(name, args):
         arg_preview = arg_preview[:117] + "..."
     print(f"\n{CYAN}  ┌─ {name}{RESET}")
     print(f"{CYAN}  │ {RESET}{DIM}{arg_preview}{RESET}")
+    # Animate the gap between "cyan args line" and "cyan result line". Tool
+    # bodies can take a while — _confirm makes a network round-trip to the
+    # risk classifier, run_bash can run for tens of seconds, write_file on a
+    # big payload takes a beat — and without this the user just sees a frozen
+    # screen after the green model output finishes. _confirm pauses/resumes
+    # us around its own I/O so the auto-allow line / Y/n prompt aren't clobbered.
+    spinner = LifeSpinner(label="running")
+    spinner.start()
+    global _ACTIVE_SPINNER
+    _ACTIVE_SPINNER = spinner
     try:
         result = fn(**args)
     except Exception as e:  # noqa: BLE001 — surface any tool error back to the model
         result = f"ERROR: {type(e).__name__}: {e}"
+    finally:
+        _ACTIVE_SPINNER = None
+        spinner.stop()
     # box the result; truncate absurdly long output for readability (model still
     # gets the full thing via the messages array)
     preview = result if len(result) < 800 else result[:800] + f"\n... [{len(result) - 800} more chars]"
@@ -417,6 +650,38 @@ class _LoggingStream:
                 pass  # never let logging break the stream
             yield chunk
 
+    def close(self):
+        close = getattr(self._inner, "close", None)
+        if close:
+            try:
+                close()
+            except Exception:
+                pass
+
+
+class _ReasoningLoopSignalCounter:
+    """Counts repeated "ready to act" phrases across streamed reasoning chunks."""
+    def __init__(self, phrases):
+        self.phrases = tuple(p.lower() for p in phrases)
+        self.tail = ""
+        self.hits = 0
+        self.max_phrase_len = max((len(p) for p in self.phrases), default=1)
+
+    def feed(self, chunk):
+        if not self.phrases:
+            return self.hits
+        old_len = len(self.tail)
+        text = self.tail + chunk.lower()
+        scan_start = max(0, old_len - self.max_phrase_len + 1)
+        for phrase in self.phrases:
+            start = text.find(phrase, scan_start)
+            while start != -1:
+                if start + len(phrase) > old_len:
+                    self.hits += 1
+                start = text.find(phrase, start + 1)
+        self.tail = text[-(self.max_phrase_len - 1):]
+        return self.hits
+
 
 # --- one model turn (streamed), returns True if it called tools -------------
 def model_turn(messages):
@@ -424,13 +689,37 @@ def model_turn(messages):
     if stream is None:
         return False  # error already reported; REPL continues
 
-    spinner = LifeSpinner()
+    # Interrupt watcher: a daemon thread watches stdin for bare Esc. On hit,
+    # it sets _USER_INTERRUPTED and closes the stream; the main loop breaks
+    # out of the chunk loop on its next iteration. We start it BEFORE the
+    # spinner so the user always has a moment to interrupt even if the first
+    # token takes a while to arrive.
+    _INTERRUPT_EVENT.clear()
+    _USER_INTERRUPTED.clear()
+    watcher = threading.Thread(target=_interrupt_watcher, daemon=True)
+    watcher.start()
+
+    spinner = LifeSpinner(label="thinking · esc to interrupt")
     spinner.start()
     t0 = time.time()
     content, tcs, mode = [], {}, None
     timings = None
+    loop_signals = _ReasoningLoopSignalCounter(REASONING_LOOP_SIGNALS)
+    loop_cut = False
+    interrupted = False
     try:
         for chunk in stream:
+            if _USER_INTERRUPTED.is_set():
+                interrupted = True
+                # close() makes the next iteration raise StopIteration / a
+                # connection error; we're breaking anyway, but be tidy
+                close = getattr(stream, "close", None)
+                if close:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                break
             # first byte in: kill the spinner, let the real output take this line
             if spinner._t is not None:
                 spinner.stop()
@@ -452,6 +741,14 @@ def model_turn(messages):
                     print(f"{DIM}  ── reasoning ──{RESET}")
                     mode = "think"
                 print(f"{DIM}{rc}{RESET}", end="", flush=True)
+                if REASONING_LOOP_SIGNAL_LIMIT > 0 and not content and not tcs:
+                    hits = loop_signals.feed(rc)
+                    if hits >= REASONING_LOOP_SIGNAL_LIMIT:
+                        loop_cut = True
+                        close = getattr(stream, "close", None)
+                        if close:
+                            close()
+                        break
             if d.content:
                 if mode == "think":
                     # close out the reasoning block; newline guarantees the green
@@ -478,6 +775,10 @@ def model_turn(messages):
                     s["args"] += tc.function.arguments
     finally:
         spinner.stop()
+        # signal the watcher to exit (it'll restore termios in its own finally)
+        _INTERRUPT_EVENT.set()
+        watcher.join(timeout=0.5)
+        _INTERRUPT_EVENT.clear()
     # reasoning-only turn (no content, no tool_calls) — close out the block so
     # the stats footer doesn't run straight into the dim reasoning text
     if mode == "think":
@@ -486,6 +787,23 @@ def model_turn(messages):
     print(RESET)
     text = "".join(content)
     elapsed = time.time() - t0
+
+    if interrupted:
+        print(f"{YELLOW}  ↳ interrupted by user (Esc) after {elapsed:4.1f}s, "
+              f"{len(content)} chars streamed{RESET}")
+        # Discard partial content — it's almost certainly a half-formed
+        # sentence / tool-call args. Append a synthetic user turn so the
+        # model has context for what just happened, then return False so the
+        # REPL drops to the prompt instead of looping into another turn.
+        messages.append({"role": "user", "content":
+            "[User interrupted your previous response with Esc. "
+            "Acknowledge briefly and wait for their next message.]"})
+        return False
+
+    if loop_cut:
+        print(f"{YELLOW}  ↳ cut reasoning loop after {loop_signals.hits} ready-to-act signals; nudging implementation{RESET}")
+        _nudge_current_user_turn(messages, REASONING_LOOP_NUDGE)
+        return True
 
     # stats footer — only if llama.cpp gave us timings; otherwise fall back to wall-clock
     if timings and timings.get("predicted_n"):
@@ -794,7 +1112,7 @@ def read_multiline(initial="", history=None):
 
 # --- repl -------------------------------------------------------------------
 BANNER = f"""{BOLD}minion{RESET} {DIM}·{RESET} {CYAN}{MODEL}{RESET}
-{DIM}  {client.base_url}  ·  /yolo /compress /compact /reset /quit  ·  log → llamacpp.log{RESET}"""
+{DIM}  {client.base_url}  ·  /yolo /approval /compress /compact /reset /quit  ·  log → llamacpp.log{RESET}"""
 
 
 def main():
@@ -815,7 +1133,30 @@ def main():
             break
         if user == "/yolo":
             globals()["YOLO"] = not YOLO
-            print(f"{DIM}  yolo={YOLO}{RESET}")
+            if YOLO:
+                globals()["APPROVE_LEVEL"] = None  # never prompt
+            else:
+                globals()["APPROVE_LEVEL"] = "low"  # back to default
+            print(f"{DIM}  yolo={YOLO}  approval={('off' if YOLO else APPROVE_LEVEL)}{RESET}")
+            continue
+        if user.startswith("/approval"):
+            parts = user.split()
+            if len(parts) == 1:
+                # /approval with no arg → show current setting
+                cur = "off (yolo)" if YOLO else (APPROVE_LEVEL or "off")
+                print(f"{DIM}  approval={cur}  (low|medium|high|yolo){RESET}")
+                continue
+            arg = parts[1].lower()
+            if arg in LEVEL_ORDER:
+                globals()["YOLO"] = False
+                globals()["APPROVE_LEVEL"] = arg
+                print(f"{DIM}  approval={arg} (prompt at {arg} and above){RESET}")
+            elif arg == "yolo":
+                globals()["YOLO"] = True
+                globals()["APPROVE_LEVEL"] = None
+                print(f"{DIM}  approval=off (yolo — never prompt){RESET}")
+            else:
+                print(f"{YELLOW}  unknown level {arg!r} — want low|medium|high|yolo{RESET}")
             continue
         if user == "/reset":
             messages = [{"role": "system", "content": SYSTEM}]

@@ -26,14 +26,70 @@ If `MINION_MODEL` is unset, minion asks the server what it's serving.
 
 ## Commands
 
-| command      | what it does                                        |
-| ------------ | --------------------------------------------------- |
-| `/yolo`      | toggle auto-approve for writes and bash             |
-| `/compress`  | summarize older turns into one, keep last 2 verbatim |
-| `/reset`     | clear conversation, keep system prompt              |
-| `/quit`      | exit                                                |
+| command             | what it does                                        |
+| ------------------- | --------------------------------------------------- |
+| `/yolo`             | toggle auto-approve for writes and bash             |
+| `/approval [level]` | show or set risk threshold (`low`/`medium`/`high`/`yolo`) |
+| `/compress`         | summarize older turns into one, keep last 2 verbatim |
+| `/reset`            | clear conversation, keep system prompt              |
+| `/quit`             | exit                                                |
 
-Pass `--yolo` on launch to start in auto-approve mode.
+## Interrupting the model
+
+Press **Esc** at any point during generation to stop the model and drop
+back to the prompt. The current stream is closed, partial output is
+discarded, and a synthetic `"you were interrupted"` user turn is appended
+to context so the model knows what happened when you send your next
+message. In-flight tool calls (e.g. `run_bash`) are **not** cancelled —
+they run to completion; Ctrl+C kills the whole process if you need a
+hard stop.
+
+## Reasoning-loop guard
+
+Reasoning models sometimes spin in place: they keep saying "let me
+implement…" / "start coding…" / "now I'll write the code…" without
+actually emitting content or a tool call. minion counts how many of those
+"ready to act" phrases show up during the reasoning phase and, after
+`MINION_REASONING_LOOP_SIGNALS` (default **10**) of them, closes the
+stream and appends a one-shot nudge to the latest user turn telling the
+model to stop planning and take a concrete action. Set the env var to `0`
+to disable, or to a smaller number (e.g. `5`) for a more aggressive cut.
+The cut prints `↳ cut reasoning loop after N ready-to-act signals; nudging
+implementation` so it's visible in the log.
+
+## Approval modes
+
+Every write / edit / bash call is risk-classified by a single cheap model
+call before it runs. Levels: `low` (read-only or trivially reversible),
+`medium` (modifies state but contained/reversible), `high` (destructive,
+hard to reverse, or broad scope). The threshold is the minimum level that
+requires approval:
+
+| flag                    | prompts at        | auto-allows       |
+| ----------------------- | ----------------- | ----------------- |
+| _(default)_             | low + medium + high | —               |
+| `--approval medium`     | medium + high     | low               |
+| `--approval high`       | high only         | low + medium      |
+| `--yolo`                | _(never)_         | everything        |
+
+In `--approval high` mode, `ls`, `cat`, single-file writes, `pip install`,
+etc. run without asking; only `rm -rf`, `git push --force`, broad
+destructive ops, etc. need a yes/no. The risk assessment is shown in
+brackets next to the prompt so you have context for the decision
+(`allow rm -rf /tmp/foo? [risk: HIGH — recursive force delete in /tmp] [Y/n]`),
+and auto-allowed calls print a one-liner
+(`↳ auto-allow [low] ls -la (read-only listing)`).
+
+The classifier is the same model you run the agent on, called with a short
+JSON-output prompt. If the call fails or returns garbage, the action is
+treated as `high` (always prompts) so we err on the side of asking. YOLO
+mode skips the classifier entirely — no point paying for a call we won't
+act on.
+
+Pass `--yolo` on launch to start in never-prompt mode, or
+`--approval <low|medium|high>` to start with a non-default threshold
+(`--approval high` is the common one — auto-allows `ls`, `cat`, single-file
+writes, `pip install`, etc., only prompts on `rm -rf`-class actions).
 
 ## Tools
 
