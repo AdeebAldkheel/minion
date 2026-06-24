@@ -41,6 +41,32 @@ footer field), `_ensure_ctx_probe()`, `_CTX_PROBE_STARTED`, and a
 switch/override. `tests/test_context_window.py` pins all three probe paths,
 caching, cache-invalidation on switch, and the `_ctx_field()` colorization.
 
+### Fixed — context-window max missing on the first turn with remote hosts
+The background probe resolved too slowly for remote providers (Together, Z.ai),
+so the first turn's footer showed a bare `ctx 607` with no `/<max>` — the max
+only filled in on a later turn. Root cause: the probe order was
+`/v1/models` → `/props` → over-`max_tokens` chat probe, optimized for local
+llama.cpp where `/v1/models` answers in sub-millisecond. But Together's
+`/v1/models` returns an **empty list** (no model entries, no context info) and
+the TLS round-trip alone costs ~2.8s; only after that wasted call did the
+over-`max_tokens` chat probe run (and resolve in ~0.1s). Total probe time
+(~3.1s) exceeded the first turn's wall time, so the cache was still empty when
+the footer rendered.
+
+`resolve_context_window()` now branches on host locality. `Source._is_local()`
+classifies the base URL (localhost, 127/10/192.168/172.16-31/169.254, or blank
+→ local; everything else → remote). **Local** sources keep the old order
+(`/v1/models` → `/props` → chat probe) — llama.cpp's metadata endpoints are
+cheap and carry `n_ctx`. **Remote** sources lead with the over-`max_tokens`
+chat probe (one cheap request, ~0.1s, works for any OpenAI-compat host that
+mirrors the "maximum context length is N tokens" 400 wording), falling back to
+`/v1/models` then `/props` only if the chat probe misses. This drops Together's
+probe from ~3.1s to ~0.45s, comfortably inside the first-turn window.
+
+New: `Source._is_local()`. `tests/test_context_window.py` adds Test 7 (a remote
+source resolves via the chat probe **without** hitting `/v1/models`) and Test 7b
+(`_is_local()` classification for localhost, LAN, and remote hosts).
+
 ### Fixed — agent silently stopping on empty turns (auto-continue)
 A model turn that produced **no content and no tool calls** used to return
 `TURN_DONE`, silently dropping the user to the chat prompt mid-task with no

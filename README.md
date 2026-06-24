@@ -119,10 +119,13 @@ context window (the server's, for the active model) is shown in the `/source`
 list and on the switch line, and the per-turn stats footer shows it next to the
 current context size — `ctx 12K/150K` — so you can see how much room is left.
 The current half is colorized by how full the window is (green < 30%, yellow
-30–60%, red 60%+), so a glance tells you whether you're nearing the limit. For
-local llama.cpp the max is read from `/v1/models`/`/props`; for remote hosts
-like Together it's probed the first time it's needed (a deliberately over-sized
-request gets rejected with the limit named in the error), then cached.
+30–60%, red 60%+), so a glance tells you whether you're nearing the limit. The
+max is probed once per source/model and cached: for **local** servers (llama.cpp)
+it reads `/v1/models`/`/props` (sub-ms LAN round-trips); for **remote** hosts
+(T Together, Z.ai, …) it leads with the over-`max_tokens` chat probe — a
+deliberately over-sized request is rejected with the limit named in the error,
+resolving in well under a second — so the `/<max>` shows up on the first turn
+rather than after a multi-second `/v1/models` round-trip that returns nothing.
 
 #### Built-in `together` source
 

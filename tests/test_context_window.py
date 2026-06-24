@@ -203,6 +203,56 @@ assert n is None, f"expected None on total miss, got {n}"
 print("  PASS\n")
 urllib.request.urlopen = orig_urlopen
 
+# --- Test 7: remote source leads with over-max_tokens probe (no /v1/models) --
+print("TEST 7: remote source tries over-max_tokens BEFORE /v1/models")
+# A remote host (Together et al.) returns an empty /v1/models and has no
+# /props, but the over-max_tokens 400 names the limit. The probe must resolve
+# on the FIRST chat request WITHOUT ever hitting /v1/models (which would cost
+# a multi-second TLS round-trip returning nothing). We assert ordering by
+# giving /v1/models a non-empty page that WOULD be consulted if it ran first
+# (context_length=999999) — if the overrun probe ran first we get 262144, not
+# the models page's 999999.
+_remote_models_calls = [0]
+
+
+class _CountingModels(_FakeModels):
+    def list(self, **kwargs):
+        _remote_models_calls[0] += 1
+        return self._page
+
+
+# Remote base_url → _is_local() is False → overrun probe leads.
+remote_err = ("Error code: 400 - " + json.dumps({
+    "error": {"message": "This model's maximum context length is 262144 tokens, "
+              "but the request requires 5000013 tokens."}}))
+remote_page = _FakeModelsPage([_FakeModel("test-model",
+                                          {"context_length": 999999})])
+src = m.Source("together", "https://api.together.xyz/v1", "sk-noop",
+               "zai-org/GLM-5.2")
+src.client = _FakeClient(_CountingModels(remote_page),
+                         _FakeChat(_FakeChatCompletions(msg=remote_err)))
+src._context_window = None
+n = src.resolve_context_window()
+print(f"  result: {n}  /v1/models calls: {_remote_models_calls[0]}")
+assert n == 262144, f"remote should resolve via overrun probe, got {n}"
+assert _remote_models_calls[0] == 0, \
+    "remote must not hit /v1/models when the overrun probe succeeds"
+print("  PASS\n")
+
+
+# --- Test 7b: _is_local() classification ------------------------------------
+print("TEST 7b: _is_local() host classification")
+_local = m.Source("local", "http://localhost:8080/v1", "sk-noop")
+_lan = m.Source("lan", "http://192.168.1.50:8080/v1", "sk-noop")
+_remote1 = m.Source("together", "https://api.together.xyz/v1", "sk-noop")
+_remote2 = m.Source("zai", "https://api.z.ai/api/paas/v4", "sk-noop")
+assert _local._is_local(), "localhost should be local"
+assert _lan._is_local(), "192.168.x should be local"
+assert not _remote1._is_local(), "api.together.xyz should be remote"
+assert not _remote2._is_local(), "api.z.ai should be remote"
+print("  PASS\n")
+
+
 # --- Test 8: switch_source invalidates the cached window ---------------------
 print("TEST 8: switch_source invalidates cached window")
 # Set up two sources and swap; the cached window should be cleared on switch.

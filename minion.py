@@ -558,20 +558,47 @@ class Source:
     # one-token prompt so the server tells us N without us ever generating.
     _CTX_LIMIT_RE = re.compile(r"maximum context length is (\d+) tokens", re.IGNORECASE)
 
+    def _is_local(self):
+        """True if this source points at a host on the local machine or LAN
+        (llama.cpp, Ollama, etc.) rather than a remote API (Together, Z.ai,
+        OpenAI, …). Local servers expose /v1/models meta and /props cheaply
+        (sub-millisecond LAN round-trips); remote hosts return empty lists or
+        404 there and waste a multi-second TLS round-trip, so the probe order
+        is flipped for them (over-max_tokens first)."""
+        host = (self.base_url or "").lower()
+        # strip the scheme
+        if "://" in host:
+            host = host.split("://", 1)[1]
+        host = host.split("/", 1)[0].split(":", 1)[0]
+        if not host:
+            return True  # blank → assume local
+        if host in ("localhost", "0.0.0.0", "::1"):
+            return True
+        # 127.x.x.x / 10.x / 192.168.x / 169.254.x / 172.16-31.x are LAN
+        if re.match(r"^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.)", host):
+            return True
+        return False
+
     def resolve_context_window(self, model=None, force=False):
         """Best-effort max context window (tokens) for `model` on this source.
 
         Returns the cached value if present (unless force=True), else probes
         and caches. Never raises — any failure returns None and the footer
-        just omits the "/<max>" suffix. Probing order, cheapest first:
+        just omits the "/<max>" suffix. Probe order depends on host locality:
 
-          1. /v1/models — llama.cpp puts n_ctx in data[0].meta; some OpenAI-
-             compat hosts put context_length on the model object directly.
-          2. /props (llama.cpp root) — default_generation_settings.n_ctx.
-          3. Over-max_tokens chat probe — send max_tokens far beyond any real
-             context with a 1-token prompt; parse the 400's "maximum context
-             length is N tokens" message (works for Together and any host that
-             mirrors OpenAI's over-limit wording). One request, no generation.
+          • Local (llama.cpp etc.) — /v1/models meta, then /props, then the
+            over-max_tokens chat probe. Local metadata endpoints are cheap
+            (sub-ms LAN) and llama.cpp stashes n_ctx in data[0].meta, so they
+            win on the first try.
+
+          • Remote (Together, Z.ai, OpenAI, …) — over-max_tokens chat probe
+            FIRST (one cheap request, ~0.1s, works for any OpenAI-compat
+            host that mirrors the "maximum context length is N tokens" 400),
+            then /v1/models as a fallback. Remote /v1/models often returns an
+            empty list or lacks context_length, and the TLS round-trip alone
+            costs 2-3s — leading with it added multi-second latency to the
+            background probe, so the first turn's footer rendered before the
+            max resolved. The chat probe resolves in well under a second.
 
         `model` defaults to the source's configured model, falling back to a
         live resolve_model() so an auto source is probed against the model it
@@ -588,9 +615,17 @@ class Source:
         if not force and self._context_window is not None:
             return self._context_window
         mid = model or self.model or self.resolve_model()
-        n = self._ctx_from_models(mid) or self._ctx_from_props()
-        if n is None:
+        if self._is_local():
+            n = self._ctx_from_models(mid) or self._ctx_from_props()
+            if n is None:
+                n = self._ctx_from_overrun_probe(mid)
+        else:
+            # Remote: the over-max_tokens chat probe is cheap and universal;
+            # lead with it so the max resolves on the first turn instead of
+            # after a multi-second /v1/models round-trip that returns nothing.
             n = self._ctx_from_overrun_probe(mid)
+            if n is None:
+                n = self._ctx_from_models(mid) or self._ctx_from_props()
         if isinstance(n, int) and n > 0:
             self._context_window = n
         # NOTE: a miss does NOT set _context_window — stays None so the
