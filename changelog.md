@@ -2,6 +2,39 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Added — automatic context compression (`MINION_AUTOCOMPRESS_PERCENT`, `/autocompress`)
+
+minion can now fold older context automatically when the conversation gets
+close to the context limit, instead of waiting for a manual `/compress`.
+Triggered after each settled model turn: if the last request's
+`prompt_tokens` filled at least `MINION_AUTOCOMPRESS_PERCENT` of the active
+source's context window, it compresses in place and prints a subtle
+`↻ auto-compressed N turns → 1 summary (M chars), kept last K verbatim`
+line. Default **85%** (set `0` to disable).
+
+- New env var `MINION_AUTOCOMPRESS_PERCENT` (default 85, clamped 0–100; `0`
+  disables auto-compression entirely). E.g. `MINION_AUTOCOMPRESS_PERCENT=30`
+  on a 170K window fires at ~51K tokens.
+- New `/autocompress` command: bare shows the current threshold/status;
+  `/autocompress <1-100>` sets it; `off`/`0`/`disable` disables; `on`/`enable`
+  restores 85%. Takes effect immediately for the next turn.
+- `compress()` gained an `auto=False` param. When `auto=True`, the keep count
+  is raised to `max(COMPRESS_KEEP, body_len // 3)` — roughly the last third of
+  the conversation stays verbatim — so auto-compress is deliberately more
+  conservative than a manual `/compress` (which keeps only the last 2 turns).
+  A manual `/compress` is still the sharp instrument; auto-compress is the
+  safety net that preserves recent work while reclaiming room.
+- `_maybe_autocompress(messages, prompt_tokens)` is the guard: returns `False`
+  (no-op) when disabled, when there's no prompt-token count, when no source is
+  active, when the context window is unknown/≤ 0, or when usage is below the
+  threshold. The new module global `_LAST_PROMPT_TOKENS` is set inside
+  `model_turn` (from both the llama.cpp `timings.prompt_n` and the OpenAI
+  `usage.prompt_tokens` code paths) and read by the REPL loop after each turn.
+- `tests/test_autocompress.py` pins the keep-formula (auto keeps ~⅓ vs
+  manual's flat 2), all the `_maybe_autocompress` guard conditions, the
+  `/autocompress` command parser (show/set/off/on/invalid/out-of-range), and
+  `MINION_AUTOCOMPRESS_PERCENT` env-var seeding + clamping.
+
 ### Added — max context window shown in the footer / `/source`
 The per-turn stats footer now shows the server's maximum context window next
 to the current context size — `ctx 12K/150K` instead of just `ctx 12K` — so

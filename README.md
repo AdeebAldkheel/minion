@@ -119,7 +119,10 @@ context window (the server's, for the active model) is shown in the `/source`
 list and on the switch line, and the per-turn stats footer shows it next to the
 current context size — `ctx 12K/150K` — so you can see how much room is left.
 The current half is colorized by how full the window is (green < 30%, yellow
-30–60%, red 60%+), so a glance tells you whether you're nearing the limit. The
+30–60%, red 60%+), so a glance tells you whether you're nearing the limit. When
+the conversation fills `MINION_AUTOCOMPRESS_PERCENT` (default 85%) of the
+window, older turns are folded into a summary automatically, keeping the last
+~⅓ verbatim — see `/autocompress`. The
 max is probed once per source/model and cached: for **local** servers (llama.cpp)
 it reads `/v1/models`/`/props` (sub-ms LAN round-trips); for **remote** hosts
 (T Together, Z.ai, …) it leads with the over-`max_tokens` chat probe — a
@@ -169,6 +172,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `MINION_REASONING_ONLY_CHARS` | reasoning-only stall cutoff before forcing a visible answer (default 36000; `0` disables) |
 | `MINION_REASONING_ONLY_RETRIES` | forced-final-answer rescue attempts after a reasoning-only stall (default 1) |
 | `MINION_TOOL_RESULT_CHARS` | per-tool-result char cap before it enters message history, to starve context-copying repetition (default 20000; `0` disables the cap, dedup still runs) |
+| `MINION_AUTOCOMPRESS_PERCENT` | auto-compress the conversation when it fills this % of the context window (default 85; `0` disables). Keeps the last ~⅓ of turns verbatim — more conservative than a manual `/compress` (which keeps 2). `/autocompress` adjusts at runtime |
 | `MINION_RECOVERY_TEMPERATURE` / `MINION_RECOVERY_TOP_P` | standard sampler params used only for recovery retries (defaults `1.0` / `0.95`; negative values omit them) |
 | `MINION_RECOVERY_MIN_P` | min-p floor for recovery retries (llama.cpp extension via `extra_body`; default `0.02`; negative omits it) |
 | `MINION_RECOVERY_REPEAT_PENALTY` / `MINION_RECOVERY_REPEAT_LAST_N` | repeat penalty applied during recovery retries to lower a looping token's logit (defaults `1.2` / `512`; negative omits them) |
@@ -201,6 +205,7 @@ so per-user settings live in one place instead of being exported every shell.
 | `/delete [target]`  | delete a saved session                                  |
 | `/compress`         | summarize older turns into one, keep last 2 verbatim     |
 | `/compact`          | alias for `/compress`                                    |
+| `/autocompress [pct\|off\|on]` | show or set the auto-compress threshold (default 85%; `0`/`off` disables) |
 | `/recover [note]`   | force a low-temp visible checkpoint after a bad stream   |
 | `/reset`            | clear conversation, start a fresh session               |
 | `/clear`            | alias for `/reset`                                       |

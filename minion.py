@@ -35,9 +35,10 @@ Sessions — every chat is auto-saved to ~/.minion/sessions/ and resumable:
   /resume <n|short-id|title>      # switch to another session mid-chat
   /save [title]                   # save the current session (title optional)
 
-Toggles in-session: /source [name] [model]  /yolo  /approval [level]  /compress  /compact  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
+Toggles in-session: /source [name] [model]  /yolo  /approval [level]  /compress  /compact  /autocompress [pct|off|on]  /reset  /clear  /new  /recover  /sessions  /resume  /save  /delete  /quit
 Flags: --yolo  --approval <all|low|medium|high|yolo>  --source <name>  --resume <target>  --session <id>
 Env:   MINION_APPROVAL=<all|low|medium|high|yolo>  (persistent default approval mode; ~/.env or shell)
+       MINION_AUTOCOMPRESS_PERCENT=<0-100>  (auto-compress threshold; 0=off; default 85)
        TOGETHER_API_KEY  (auto-registers a built-in `together` source; default model zai-org/GLM-5.2)
 """
 import json
@@ -798,6 +799,12 @@ ACTIVE = None       # current Source
 client = None
 MODEL = None
 
+# Updated by model_turn() on every turn that reports a prompt-token count
+# (llama.cpp timings.prompt_n or OpenAI/Z.ai usage.prompt_tokens). Read by
+# _maybe_autocompress() after a turn settles to decide whether the context
+# window is full enough to warrant a silent auto-compress.
+_LAST_PROMPT_TOKENS = 0
+
 
 def switch_source(name, model_override=None):
     """Swap the active source. Reassigns client + MODEL globals. Returns True
@@ -1527,6 +1534,15 @@ FORCED_FINAL_MAX_TOKENS = _env_int("MINION_FORCED_FINAL_MAX_TOKENS", 2048)
 EMPTY_TURN_RETRY_LIMIT = _env_int("MINION_EMPTY_TURN_RETRIES", 3)
 RUNTIME_NOTE_RE = re.compile(r"\n\n\[Runtime note: .*?\]\s*$", re.DOTALL)
 
+# --- auto context-compression -----------------------------------------------
+# When the context window fills past this fraction (default 85%), the next
+# settled model turn silently compresses the older history so the chat can
+# keep going instead of running out of room. Unlike manual /compress (which
+# keeps only COMPRESS_KEEP=2 turns), auto-compress is conservative: it keeps
+# more recent turns so in-progress work isn't disturbed. Set to 0 to disable.
+AUTOCOMPRESS_PERCENT = _env_int("MINION_AUTOCOMPRESS_PERCENT", 85)
+AUTOCOMPRESS_PERCENT = max(0, min(100, AUTOCOMPRESS_PERCENT))  # clamp 0–100
+
 FORCED_FINAL_NUDGE = (
     "Your previous streamed response produced reasoning only. Do not continue "
     "private reasoning. Use the final_answer tool if available. Return a complete "
@@ -2086,7 +2102,7 @@ def open_stream(messages, tools=TOOLS, tool_choice=None, max_tokens=None,
 COMPRESS_KEEP = 2  # how many recent turns to leave untouched
 
 
-def compress(messages, keep=COMPRESS_KEEP):
+def compress(messages, keep=COMPRESS_KEEP, auto=False):
     """Ask the model to summarize everything except system + last `keep` turns.
 
     Mutates `messages` in place on success: replaces the middle slice with a
@@ -2095,14 +2111,23 @@ def compress(messages, keep=COMPRESS_KEEP):
 
     Non-streaming on purpose — we want the whole summary before splicing it in,
     and a spinner for a one-shot summary would be visual noise.
+
+    When auto=True the keep count is raised above COMPRESS_KEEP so
+    auto-compression (triggered when the context window fills past
+    AUTOCOMPRESS_PERCENT) is more conservative than a manual /compress —
+    it keeps roughly the last third of the conversation verbatim so
+    in-progress work and recent tool results survive the fold.
     """
     # Layout: [system?, ..., user, assistant, tool, ..., user, assistant(tool_calls)?, ...]
     # We assume messages[0] is the system prompt (matches how main() builds it).
     # Anything before the "tail" we want to summarize; the tail stays verbatim.
+    sys_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+    if auto:
+        body_len = len(messages) - (1 if sys_msg else 0)
+        keep = max(keep, body_len // 3)
     if len(messages) <= 1 + keep:
         return None  # nothing to compress
 
-    sys_msg = messages[0] if messages and messages[0].get("role") == "system" else None
     body = messages[1:] if sys_msg else messages
     if len(body) <= keep:
         return None
@@ -2197,6 +2222,40 @@ def compress(messages, keep=COMPRESS_KEEP):
     new_mid = [{"role": "user", "content": f"{header}\n\n{summary}"}]
     messages[:] = ([sys_msg] if sys_msg else []) + new_mid + tail
     return len(tail), summarized_n, len(summary)
+
+
+def _maybe_autocompress(messages, prompt_tokens):
+    """Silently compress when context usage crosses the AUTOCOMPRESS_PERCENT
+    threshold. Called after each settled model turn with the last turn's
+    `prompt_tokens` (the size of the context the model just saw).
+
+    Returns True if a compression happened, False otherwise. Guards:
+      - AUTOCOMPRESS_PERCENT == 0 → disabled
+      - ACTIVE context window unknown / ≤ 0 → can't compute a ratio
+      - ratio < threshold → nothing to do
+      - compress() itself bails when there's too little to fold
+    """
+    if AUTOCOMPRESS_PERCENT <= 0:
+        return False
+    if not isinstance(prompt_tokens, int) or prompt_tokens <= 0:
+        return False
+    if ACTIVE is None:
+        return False
+    mx = ACTIVE._context_window
+    if not isinstance(mx, int) or mx <= 0:
+        return False
+    ratio = prompt_tokens / mx
+    if ratio * 100 < AUTOCOMPRESS_PERCENT:
+        return False
+    result = compress(messages, auto=True)
+    if result is None:
+        return False
+    kept_n, summarized_n, summary_chars = result
+    pct = int(ratio * 100)
+    print(f"{DIM}  ↻ auto-compressed {summarized_n} turns → 1 summary "
+          f"({summary_chars} chars), kept last {kept_n} verbatim "
+          f"(context was at {pct}% of {_abbr(mx)}){RESET}")
+    return True
 
 
 class _LoggingStream:
@@ -2316,6 +2375,7 @@ def _ensure_ctx_probe(src):
 # --- one model turn (streamed), returns TURN_* status -----------------------
 def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=0,
                empty_turn_count=0, forced_final=False, recovery_sampling=False):
+    global _LAST_PROMPT_TOKENS
     # Start the spinner BEFORE open_stream() so the HTTP-handshake + interrupt-
     # watcher-setup window (which can be tens of ms on a warm local server but
     # seconds on a cold/wake-from-sleep one) isn't a frozen green-text gap.
@@ -2582,6 +2642,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
         _METRICS.add(_normalize_usage(usage, timings))
     if timings and timings.get("predicted_n"):
         prompt_n = timings.get("prompt_n", 0)
+        if prompt_n:
+            _LAST_PROMPT_TOKENS = prompt_n
         gen_n = timings["predicted_n"]
         tps = timings.get("predicted_per_second", 0)
         ctx = _ctx_field(prompt_n)
@@ -2595,6 +2657,8 @@ def model_turn(messages, reasoning_loop_cut_count=0, malformed_stream_cut_count=
     elif usage and (usage.completion_tokens or 0):
         gen_n = usage.completion_tokens or 0
         prompt_n = usage.prompt_tokens or 0
+        if prompt_n:
+            _LAST_PROMPT_TOKENS = prompt_n
         tps = gen_n / elapsed if elapsed > 0 else 0
         ctx = _ctx_field(prompt_n)
         parts = [f"{gen_n} tok", f"{tps:5.1f} tok/s", ctx]
@@ -3080,7 +3144,7 @@ def _banner():
 
 
 def main():
-    global YOLO, APPROVE_LEVEL, DEFAULT_APPROVE_LEVEL
+    global YOLO, APPROVE_LEVEL, DEFAULT_APPROVE_LEVEL, AUTOCOMPRESS_PERCENT
     # `minion sessions [query]` — discover + exit, no REPL. Checked first so
     # it short-circuits before the banner / network source resolution that the
     # interactive loop depends on.
@@ -3357,6 +3421,37 @@ def main():
                   f"({summary_chars} chars), kept last {kept_n} verbatim{RESET}")
             session_dirty = True
             continue
+        if user == "/autocompress" or user.startswith("/autocompress "):
+            arg = user[len("/autocompress"):].strip().lower()
+            if not arg:
+                if AUTOCOMPRESS_PERCENT <= 0:
+                    print(f"{DIM}  auto-compress: off{RESET}")
+                else:
+                    print(f"{DIM}  auto-compress: {AUTOCOMPRESS_PERCENT}% "
+                          f"(auto-compress when context ≥ {AUTOCOMPRESS_PERCENT}% full){RESET}")
+                continue
+            if arg in ("off", "disable", "0"):
+                AUTOCOMPRESS_PERCENT = 0
+                print(f"{DIM}  auto-compress: off (disabled){RESET}")
+                continue
+            if arg in ("on", "enable"):
+                AUTOCOMPRESS_PERCENT = 85
+                print(f"{DIM}  auto-compress: {AUTOCOMPRESS_PERCENT}% "
+                      f"(auto-compress when context ≥ {AUTOCOMPRESS_PERCENT}% full){RESET}")
+                continue
+            try:
+                val = int(arg)
+            except ValueError:
+                print(f"{YELLOW}  usage: /autocompress [<1-100|off|on>] — "
+                      f"current: {AUTOCOMPRESS_PERCENT}%{RESET}")
+                continue
+            if not (1 <= val <= 100):
+                print(f"{YELLOW}  {val} is out of range — want 1–100 (or off / on){RESET}")
+                continue
+            AUTOCOMPRESS_PERCENT = val
+            print(f"{DIM}  auto-compress: {val}% "
+                  f"(auto-compress when context ≥ {val}% full){RESET}")
+            continue
         # --- session commands -------------------------------------------------
         if user == "/sessions" or user.startswith("/sessions "):
             _cmd_sessions(user, session_id)
@@ -3409,6 +3504,12 @@ def main():
         # turn so a crash / accidental close never loses work.
         session_dirty = True
         _save_current()
+        # Maybe auto-compress: if the context window is over the configured
+        # fill threshold, silently fold the older turns so the chat can keep
+        # going. Done after the save so the pre-compression state is on disk;
+        # the compressed result is persisted by the _save_current() below.
+        if _maybe_autocompress(messages, _LAST_PROMPT_TOKENS):
+            _save_current()
         # Maybe refresh the model-generated description (a cheap non-streaming
         # call every SESSION_DESC_REFRESH turns). Done after the save so the
         # turn's messages are already on disk; the description lands as a
