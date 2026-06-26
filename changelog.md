@@ -2,6 +2,51 @@
 
 All notable changes to `minion.py` from this point forward.
 
+### Fixed — keystroke-eating lag in long sessions (interrupt watcher leak)
+
+In sessions that ran for many turns, the terminal would get progressively
+laggy — 50–75% of keystrokes silently dropped, so you had to hammer each key
+several times before it registered. Only the minion terminal was affected;
+Ctrl+C and `/save` then `minion --resume` "fixed" it because restarting tore
+down the leaked threads. Nothing else on the machine slowed down.
+
+Root cause: the Esc-to-interrupt watcher. Each `model_turn` spawned a fresh
+daemon thread that reads stdin byte-by-byte and **discards anything that
+isn't Esc**. The turn-end cleanup stopped it with
+`watcher.join(timeout=0.5)` — a timed join, **not** a guaranteed kill. If
+the thread was mid-read when the half-second elapsed, it kept running, and
+the `finally` then `_INTERRUPT_EVENT.clear()`d the very flag the thread
+needs to notice it should stop. That leaked thread was then immortal and
+sat in a tight `select` + `os.read` loop stealing every non-Esc keystroke
+that the chatbox was supposed to get. Worse, `termios` is global to the tty
+(not per-thread), so leaked watchers fighting the chatbox over `VMIN`
+(watcher sets `0`, chatbox sets `1`) could end up in a *blocking* `os.read`
+from which they could never re-check the exit flag — so the next turn's
+`_INTERRUPT_EVENT.set()` couldn't reach them and the leaks stacked, which
+is why the lag grew worse the longer the session ran.
+
+Fix: replaced spawn-per-turn with a **single persistent daemon thread**
+started once via `_ensure_interrupt_watcher()` and *parked* between turns.
+The new arm/disarm protocol (`_INTERRUPT_ARMED` / `_INTERRUPT_EXIT` /
+`_USER_INTERRUPTED`) means there is ever only one stdin reader in the
+process, and when parked (between turns) it touches stdin **not at all** —
+it waits on `_INTERRUPT_ARMED` and leaves the chatbox / approval prompt as
+the sole keystroke consumer. No spawn/join window exists to leak through.
+
+- New `_ensure_interrupt_watcher()` lazily starts the singleton and is a
+  no-op if the thread is already alive. `_INTERRUPT_ARMED.set()` /
+  `.clear()` replace the old spawn + timed-join dance in `model_turn`'s
+  prologue and `finally`.
+- The watcher's outer loop parks on `_INTERRUPT_ARMED.wait(...)` when
+  disarmed; only the armed inner loop calls `select`/`os.read`, and it
+  restores termios on every disarm. `_INTERRUPT_EXIT` is reserved for
+  process teardown.
+- Tests: new `tests/test_interrupt_watcher_singleton.py` verifies the
+  single-reader invariant (one parked thread reused across many arm cycles,
+  never replaced) and that disarm clears a stale `_USER_INTERRUPTED`. All
+  existing `test_esc_approval.py` cases still pass (they monkeypatch
+  `_interrupt_watcher`, which `_ensure_interrupt_watcher` honors).
+
 ### Fixed — `read_file` empty-file marker, `/autocompress on`, abbr + docs
 
 - `read_file` on an empty file now returns a clear `[<path>: empty file]` marker
